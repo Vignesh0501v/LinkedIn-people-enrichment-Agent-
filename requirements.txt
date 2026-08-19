@@ -1,0 +1,14 @@
+pandas
+openpyxl
+httpx
+nameparser
+pytest
+redis
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+sqlalchemy
+psycopg2-binary
+langchain-core
+langchain-groq

@@ -1,0 +1,96 @@
+# Plan unit #22. Four services: the two datastores (redis for caching /
+# batch resumability / mapping templates, postgres for chat session+turn
+# history since unit #23), the FastAPI backend, and the built frontend
+# behind nginx.
+#
+# Note on URLs: inside this network the backend reaches its stores by
+# *service name* (redis, postgres); the browser reaches the backend on the
+# host's published port 8000. That's why app/config.py's defaults stay
+# localhost-based -- they describe a developer's laptop, and the overrides
+# live here rather than in Python.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: linkedin_enrichment
+    ports:
+      # Host-side port is 5433, not 5432 -- avoids colliding with any other
+      # project's Postgres container on this machine (hit this locally: a
+      # different project's `cable_payment_db` already holds 5432). The
+      # `backend` service still talks to this container on its internal
+      # 5432 via the `postgres` hostname, unaffected by this remap.
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -U/-d are required: pg_isready otherwise probes as the root OS user
+      # against a database that doesn't exist, and reports the server
+      # unhealthy even once it's accepting connections.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d linkedin_enrichment"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: backend
+    # API keys come from .env (compose's own env_file, not python-dotenv --
+    # inside the container these arrive as real environment variables, which
+    # is what app/config.py reads either way).
+    env_file:
+      - .env
+    environment:
+      # Set after env_file so these win over any localhost values a
+      # developer has in .env for their non-Docker runs.
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/linkedin_enrichment
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked in at build time by Vite. This is the URL the *browser*
+        # uses, so it must be host-reachable -- not the `backend` service
+        # name, which only resolves inside the compose network.
+        VITE_API_BASE_URL: http://localhost:8000
+    container_name: frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:
