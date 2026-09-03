@@ -27,10 +27,13 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: postgres
+    # Credentials come from .env (docker compose auto-loads it for ${...}
+    # substitution here, separate from the `env_file:` key used below on
+    # `backend`) -- never hardcode them in this tracked file.
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: linkedin_enrichment
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       # Host-side port is 5433, not 5432 -- avoids colliding with any other
       # project's Postgres container on this machine (hit this locally: a
@@ -44,7 +47,7 @@ services:
       # -U/-d are required: pg_isready otherwise probes as the root OS user
       # against a database that doesn't exist, and reports the server
       # unhealthy even once it's accepting connections.
-      test: ["CMD-SHELL", "pg_isready -U postgres -d linkedin_enrichment"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -63,9 +66,11 @@ services:
       - .env
     environment:
       # Set after env_file so these win over any localhost values a
-      # developer has in .env for their non-Docker runs.
+      # developer has in .env for their non-Docker runs. Credentials still
+      # come from .env via ${...} substitution -- only the hostname
+      # (`postgres`, the compose service name) is hardcoded here.
       REDIS_URL: redis://redis:6379
-      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/linkedin_enrichment
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     ports:
       - "8000:8000"
     depends_on:
