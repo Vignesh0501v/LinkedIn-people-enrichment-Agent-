@@ -62,6 +62,10 @@ VALID_KINDS: set[str] = {
     # Unit #25: a conversational reply to a turn Groq classified as a
     # greeting -- no batch, no mapping, nothing to confirm.
     "greeting_reply",
+    # A system question asked in-thread when auto-mapping isn't confident
+    # enough to run on its own -- replaces the old manual mapping-editor
+    # confirmation step; the operator's next plain-text turn is the answer.
+    "clarification_question",
 }
 
 # How much of the first user turn to keep for a sidebar row label. Long

@@ -159,20 +159,11 @@ def test_happy_path_paste_to_download(monkeypatch):
     turn_body = turn_resp.json()
     assert turn_body["columns"] == ["Name", "Company"]
     batch_id = turn_body["batch_id"]
-    assert turn_body["proposal"]["selected_fields"] == ["company", "name"]
-
-    mapping_resp = client.put(
-        f"/sessions/{session_id}/batches/{batch_id}/mapping",
-        json=_NAME_COMPANY_PROPOSAL_MAPPINGS,
-    )
-    assert mapping_resp.status_code == 200
-
-    criteria_resp = client.put(
-        f"/sessions/{session_id}/batches/{batch_id}/criteria",
-        json={"selected_fields": ["name", "company"]},
-    )
-    assert criteria_resp.status_code == 200
-    assert criteria_resp.json()["search_mode"] == "person"
+    # Confident enough to auto-confirm and run without a manual mapping/
+    # criteria step -- the turn response already reflects the run.
+    assert turn_body["status"] == "running"
+    assert turn_body["selected_fields"] == ["company", "name"]
+    assert turn_body["search_mode"] == "person"
 
     status_resp = client.get(f"/sessions/{session_id}/batches/{batch_id}")
     assert status_resp.status_code == 200
@@ -205,7 +196,7 @@ def test_happy_path_paste_to_download(monkeypatch):
     session_resp = client.get(f"/sessions/{session_id}")
     assert session_resp.status_code == 200
     kinds = [t["kind"] for t in session_resp.json()["turns"]]
-    assert kinds == ["pasted_table", "mapping_proposal", "mapping_confirmed", "mapping_confirmed"]
+    assert kinds == ["pasted_table", "mapping_proposal", "mapping_confirmed"]
 
 
 def test_criteria_rejects_selecting_an_unmapped_field():
@@ -281,17 +272,10 @@ def test_row_missing_selected_criterion_value_is_flagged_before_any_search_call(
     # ever calling Tavily for it.
     pasted_text = "Name\tCompany\nJane Doe\tAcme\nJohn Smith\t"
     turn_resp = client.post(f"/sessions/{session_id}/turns", data={"pasted_text": pasted_text})
-    batch_id = turn_resp.json()["batch_id"]
-
-    client.put(
-        f"/sessions/{session_id}/batches/{batch_id}/mapping",
-        json=_NAME_COMPANY_PROPOSAL_MAPPINGS,
-    )
-    criteria_resp = client.put(
-        f"/sessions/{session_id}/batches/{batch_id}/criteria",
-        json={"selected_fields": ["name", "company"]},
-    )
-    assert criteria_resp.status_code == 200
+    assert turn_resp.status_code == 200
+    turn_body = turn_resp.json()
+    assert turn_body["status"] == "running"
+    batch_id = turn_body["batch_id"]
 
     rows_resp = client.get(
         f"/sessions/{session_id}/batches/{batch_id}/rows", params={"status": "MISSING_SEARCH_FIELD"}
@@ -417,19 +401,8 @@ def test_single_lookup_happy_path():
     # The extracted field names ARE the batch's columns (identity mapping) --
     # this is what makes confirm_mapping able to accept a non-null source_column.
     assert set(turn_body["columns"]) == {"full_name", "company"}
-    assert turn_body["proposal"]["selected_fields"] == ["company", "name"]
-
-    proposed_mappings = turn_body["proposal"]["field_mappings"]
-    mapping_resp = client.put(
-        f"/sessions/{session_id}/batches/{batch_id}/mapping", json=proposed_mappings
-    )
-    assert mapping_resp.status_code == 200
-
-    criteria_resp = client.put(
-        f"/sessions/{session_id}/batches/{batch_id}/criteria",
-        json={"selected_fields": ["name", "company"]},
-    )
-    assert criteria_resp.status_code == 200
+    assert turn_body["status"] == "running"
+    assert turn_body["selected_fields"] == ["company", "name"]
 
     status_resp = client.get(f"/sessions/{session_id}/batches/{batch_id}")
     assert status_resp.status_code == 200
@@ -463,7 +436,7 @@ def test_list_sessions_is_newest_first_with_a_usable_preview():
     # `first` was touched most recently (it got a turn), so it sorts first.
     assert [s["session_id"] for s in sessions] == [first, second]
     assert sessions[0]["first_turn_preview"] == "Pasted table (1 rows)"
-    assert sessions[0]["turn_count"] == 2  # the pasted table + the mapping proposal
+    assert sessions[0]["turn_count"] == 3  # the pasted table + the mapping proposal + auto-confirm
     assert sessions[1]["first_turn_preview"] == ""
     assert "last_active_at" in sessions[0] and "created_at" in sessions[0]
 
@@ -627,6 +600,138 @@ def test_context_window_is_capped_at_five_turns():
 
     # 10 turns of history exist by the last call; only the window is sent.
     assert len(seen[-1]) - 2 <= CONTEXT_WINDOW_TURNS
+
+
+# --- Conversational auto-mapping: clarification questions replace the
+# manual mapping/criteria editor, and a short follow-up merges onto the
+# previous single-lookup turn's fields instead of searching on its own. ---
+
+
+def test_single_lookup_with_insufficient_fields_asks_a_clarifying_question_instead_of_a_batch():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _groq_json_response({"fields": {}, "intent": "data_request", "output_format": "table", "reply": ""})
+
+    client = _make_test_client(handler, lambda request: httpx.Response(200, json={"results": []}))
+    session_id = _create_session(client)
+
+    resp = client.post(f"/sessions/{session_id}/turns", data={"instructions_text": "find someone"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "clarification_needed"
+    assert body["batch_id"] is None
+    assert body["question"]
+
+    kinds = [t["kind"] for t in client.get(f"/sessions/{session_id}").json()["turns"]]
+    assert kinds == ["instruction_text", "clarification_question"]
+
+
+def test_followup_fragment_merges_onto_the_previous_single_lookup_fields():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _groq_json_response({"fields": {"full_name": "Praveen B", "company": "Hexware"}, "intent": "data_request"})
+        return _groq_json_response({"fields": {"title": "domain expert"}, "intent": "data_request"})
+
+    tavily_queries: list[str] = []
+
+    def tavily_handler(request: httpx.Request) -> httpx.Response:
+        tavily_queries.append(json.loads(request.read())["query"])
+        return httpx.Response(200, json={"results": []})
+
+    client = _make_test_client(handler, tavily_handler)
+    session_id = _create_session(client)
+
+    first = client.post(
+        f"/sessions/{session_id}/turns", data={"instructions_text": "find Praveen B working in Hexware"}
+    )
+    assert first.json()["status"] == "running"
+
+    second = client.post(f"/sessions/{session_id}/turns", data={"instructions_text": "domain expert"})
+    body = second.json()
+    assert body["intent"] == "data_request"
+    assert body["status"] == "running"
+    assert set(body["columns"]) == {"full_name", "company", "title"}
+
+    # The refined search's query carries all three merged fields, not just
+    # the fragment alone -- this is the actual guarantee behind "does a
+    # short follow-up like 'domain expert' get combined with what was
+    # already asked", not just that conversation history was *visible* to
+    # the model.
+    assert any("Praveen B" in q and "Hexware" in q and "domain expert" in q for q in tavily_queries)
+
+
+def test_followup_that_is_itself_a_full_lookup_does_not_merge_with_the_previous_one():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _groq_json_response({"fields": {"full_name": "Praveen B", "company": "Hexware"}, "intent": "data_request"})
+        return _groq_json_response({"fields": {"full_name": "Alice Smith", "company": "Beta Corp"}, "intent": "data_request"})
+
+    client = _make_test_client(handler, lambda request: httpx.Response(200, json={"results": []}))
+    session_id = _create_session(client)
+
+    client.post(f"/sessions/{session_id}/turns", data={"instructions_text": "find Praveen B working in Hexware"})
+    second = client.post(f"/sessions/{session_id}/turns", data={"instructions_text": "find Alice Smith at Beta Corp"})
+
+    body = second.json()
+    assert set(body["columns"]) == {"full_name", "company"}
+    raw_rows = client.get(f"/sessions/{session_id}/batches/{body['batch_id']}/rows").json()["rows"]
+    assert raw_rows[0]["field_values"]["full_name"] == "Alice Smith"
+
+
+def test_instructions_text_that_looks_like_a_table_is_routed_as_a_paste():
+    # The merged input box has one text field for both a pasted table and a
+    # single lookup -- routing is decided by the text's own shape, not by a
+    # mode the user picked.
+    client = _make_test_client(_default_groq_handler, lambda request: httpx.Response(200, json={"results": []}))
+    session_id = _create_session(client)
+
+    resp = client.post(
+        f"/sessions/{session_id}/turns",
+        data={"instructions_text": "Name\tCompany\nJane Doe\tAcme"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["columns"] == ["Name", "Company"]
+
+    kinds = [t["kind"] for t in client.get(f"/sessions/{session_id}").json()["turns"]]
+    assert kinds[0] == "pasted_table"
+
+
+def test_paste_with_unmappable_columns_asks_then_resolves_from_the_answer():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _groq_response([], [])  # nothing confidently mapped
+        return _groq_response(
+            [
+                {"standard_field": "full_name", "source_column": "A"},
+                {"standard_field": "company", "source_column": "B"},
+            ],
+            ["name", "company"],
+        )
+
+    client = _make_test_client(handler, lambda request: httpx.Response(200, json={"results": []}))
+    session_id = _create_session(client)
+
+    first = client.post(f"/sessions/{session_id}/turns", data={"pasted_text": "A\tB\nJane Doe\tAcme"})
+    body = first.json()
+    assert body["intent"] == "clarification_needed"
+    assert body["batch_id"] is not None
+    assert body["question"]
+
+    second = client.post(
+        f"/sessions/{session_id}/turns", data={"instructions_text": "A is the name, B is the company"}
+    )
+    body2 = second.json()
+    assert body2["intent"] == "data_request"
+    assert body2["status"] == "running"
+    assert body2["batch_id"] == body["batch_id"]
 
 
 # --- Unit #26: Summary sheet in the Excel export ---

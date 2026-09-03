@@ -229,6 +229,95 @@ def _context_from_turns(turns: list[Turn]) -> list[dict[str, str]]:
     return context
 
 
+def _looks_like_pasted_table(text: str) -> bool:
+    """Cheap, deterministic table/free-text split for the merged input box:
+    a real header-plus-row paste always has >=2 columns and >=1 data row
+    once run through the same parser the paste flow already uses (reusing
+    it rather than a second heuristic, so the two never disagree). A single
+    lookup sentence -- however it's phrased or however many lines it wraps
+    onto -- never produces that shape."""
+    columns, rows, _ = parse_pasted_table(text)
+    return len(columns) >= 2 and len(rows) >= 1
+
+
+def _last_user_data_turn(turns: list[Turn]) -> Turn | None:
+    for turn in reversed(turns):
+        if turn.role == "user" and turn.kind in ("instruction_text", "file_upload", "pasted_table"):
+            return turn
+    return None
+
+
+def _carry_forward_fields(turns: list[Turn]) -> dict[str, str]:
+    """Field values extracted from the most recent single-lookup turn, for a
+    short follow-up (e.g. "domain expert") to merge against -- but only if
+    the conversation hasn't moved on to a file/paste since, which would mean
+    a fresh, unrelated request rather than a refinement of the last lookup.
+    """
+    last = _last_user_data_turn(turns)
+    if last is None or last.kind != "instruction_text":
+        return {}
+    payload = last.payload if isinstance(last.payload, dict) else {}
+    fields = payload.get("extracted_fields")
+    return dict(fields) if isinstance(fields, dict) else {}
+
+
+def _is_standalone_lookup(fields: dict[str, str]) -> bool:
+    """True when `fields` alone reads as a complete, independent request
+    (a name, or a deliberate company-only lookup) rather than a fragment
+    that only makes sense appended to whatever was just asked. Used only to
+    decide *whether* to attempt a carry-forward merge -- a single stray
+    field like a title or email is exactly the case a merge should catch."""
+    if _NAME_STANDARD_FIELDS & fields.keys():
+        return True
+    return set(fields.keys()) == {"company"}
+
+
+def _fields_are_usable(fields: dict[str, str]) -> bool:
+    proposal = _identity_proposal_for_single_lookup(list(fields.keys()))
+    return not validate_criteria(proposal.selected_fields, proposal.field_mappings)
+
+
+def _clarifying_question_for_fields(known: dict[str, str]) -> str:
+    if known:
+        known_desc = ", ".join(f"{k.replace('_', ' ')} “{v}”" for k, v in known.items())
+        return (
+            f"I have {known_desc} so far, but that's not quite enough to search LinkedIn "
+            "confidently. Could you give me a name, or a company, to search for?"
+        )
+    return "Who would you like me to look up? A name, and ideally a company, works best."
+
+
+def _clarifying_question_for_columns(columns: list[str]) -> str:
+    column_list = ", ".join(columns) if columns else "(no columns detected)"
+    return (
+        "I couldn't confidently tell which column holds the person's name or company. "
+        f"Your columns are: {column_list}. Which column(s) should I use for name / company / "
+        "title / email?"
+    )
+
+
+def _pending_mapping_batch(turns: list[Turn], batch_store: BatchStore) -> Batch | None:
+    """The most recently proposed file/paste batch, if it's still waiting on
+    a clarifying answer (Groq's proposal didn't confidently map anything to
+    search by, so the batch was never auto-confirmed). `None` once that
+    batch is resolved or if the most recent proposal was a single_lookup
+    one (those are never left half-created -- see `create_turn`)."""
+    for turn in reversed(turns):
+        if turn.kind != "mapping_proposal":
+            continue
+        payload = turn.payload if isinstance(turn.payload, dict) else {}
+        batch_id = payload.get("batch_id")
+        if not batch_id:
+            return None
+        batch = batch_store.get_batch(batch_id)
+        if batch is None or batch.input_kind == "single_lookup":
+            return None
+        if batch_store.get_criteria(batch_id) is None:
+            return batch
+        return None
+    return None
+
+
 def _build_summary_frame(
     batch: Batch,
     selected_fields: set[str],
@@ -271,6 +360,44 @@ def _resolve_output_format(requested: str, row_count: int) -> str:
     if row_count > MAX_INLINE_TABLE_ROWS:
         return "excel"
     return requested if requested in ("table", "excel") else "table"
+
+
+def _auto_confirm_and_run(
+    session_id: str,
+    batch: Batch,
+    mappings: list[FieldMapping],
+    selected_fields: set[str],
+    batch_store: BatchStore,
+    session_store: SessionStore,
+    tavily_client: TavilyClient,
+    groq_client: GroqClient,
+    background_tasks: BackgroundTasks,
+) -> Batch:
+    """Confirm mapping + criteria and kick off the run, without an operator
+    ever seeing a mapping/criteria editor -- the conversational replacement
+    for the old two-step `PUT .../mapping` + `PUT .../criteria` flow. Only
+    called once `validate_criteria` has already found nothing wrong with
+    `mappings`/`selected_fields`."""
+    search_mode = derive_search_mode(selected_fields)
+    batch_store.save_mapping(batch.id, mappings)
+    batch_store.save_criteria(batch.id, selected_fields)
+    batch = replace(batch, status="mapping_confirmed", search_mode=search_mode)
+    batch_store.save_batch(batch)
+
+    session_store.add_turn(
+        session_id,
+        role="system",
+        kind="mapping_confirmed",
+        payload={
+            "batch_id": batch.id,
+            "field_mappings": _mapping_to_payload(mappings),
+            "selected_fields": sorted(selected_fields),
+            "search_mode": search_mode,
+            "auto_confirmed": True,
+        },
+    )
+    background_tasks.add_task(run_batch, batch.id, batch_store, tavily_client, groq_client)
+    return batch
 
 
 def create_app(
@@ -361,6 +488,7 @@ def create_app(
     @app.post("/sessions/{session_id}/turns")
     async def create_turn(
         session_id: str,
+        background_tasks: BackgroundTasks,
         instructions_text: str | None = Form(None),
         pasted_text: str | None = Form(None),
         file: UploadFile | None = File(None),
@@ -369,42 +497,108 @@ def create_app(
 
         # Unit #25: the session's recent history goes to Groq as
         # conversational context, so a short follow-up resolves against what
-        # was already asked. Read before this turn is appended.
-        context = _context_from_turns(session_store.get_turns(session_id))
+        # was already asked. Read before this turn is appended. The full
+        # (untrimmed) list is also what the carry-forward/clarification
+        # helpers below scan, since they need turns further back than
+        # Groq's own context window.
+        all_turns = session_store.get_turns(session_id)
+        context = _context_from_turns(all_turns)
+
+        turn_kind: str | None = None
+        turn_payload: dict[str, Any] | None = None
 
         if file is not None:
             content = await file.read()
             input_kind = "file"
             columns, raw_rows = _read_excel_bytes(content)
             turn_kind = "file_upload"
-            turn_payload: dict[str, Any] = {
+            turn_payload = {
                 "filename": file.filename,
                 "row_count": len(raw_rows),
                 "instructions_text": instructions_text,
             }
             requested_output_format = "table"
-        elif pasted_text:
+
+        elif pasted_text or (instructions_text and _looks_like_pasted_table(instructions_text)):
+            # The redesigned input has one free-text box for both a pasted
+            # table and a single lookup -- `pasted_text` stays accepted
+            # as-is for direct API callers, but text arriving as
+            # `instructions_text` that itself parses into >=2 columns and
+            # >=1 row is table paste in every way that matters, so it's
+            # routed the same way rather than asking the frontend to guess.
+            raw_text = pasted_text if pasted_text else instructions_text
+            accompanying_text = instructions_text if pasted_text else None
             input_kind = "paste"
-            columns, raw_rows, warnings = parse_pasted_table(pasted_text)
+            columns, raw_rows, warnings = parse_pasted_table(raw_text or "")
             turn_kind = "pasted_table"
             turn_payload = {
                 "row_count": len(raw_rows),
                 "warnings": warnings,
-                "instructions_text": instructions_text,
+                "instructions_text": accompanying_text,
             }
             requested_output_format = "table"
+
         elif instructions_text:
             # No file/pasted table, so there are no source columns to map --
             # extract_single_lookup pulls the field *values* straight out of
-            # the text instead (see app/intent_extraction.py). Using those
-            # extracted field names as the batch's "columns" makes an
-            # identity mapping trivially valid, which is what actually lets
-            # a single_lookup batch reach confirm_mapping/confirm_criteria
-            # instead of having an empty column list nothing can ever map to.
+            # the text instead (see app/intent_extraction.py).
             #
             # This is also the only path where greeting detection applies
             # (unit #25): a file upload or pasted table is a data request by
             # construction, whatever text accompanies it.
+            #
+            # Before treating this as a brand-new request, check whether an
+            # earlier file/paste batch in this session is still waiting on a
+            # clarifying answer about which column is which -- if so, this
+            # text is that answer, not a fresh single lookup.
+            pending_batch = _pending_mapping_batch(all_turns, batch_store)
+            if pending_batch is not None:
+                session_store.add_turn(
+                    session_id, role="user", kind="instruction_text", payload={"text": instructions_text}
+                )
+                pending_columns = batch_store.get_columns(pending_batch.id)
+                pending_sample_rows = batch_store.get_raw_rows(pending_batch.id)[:5]
+                try:
+                    proposal = propose_mapping(
+                        instructions_text, pending_columns, pending_sample_rows,
+                        client=groq_client, context=context,
+                    )
+                except GROQ_TRANSPORT_ERRORS as exc:
+                    raise HTTPException(status_code=502, detail=f"Groq API request failed: {exc}") from exc
+
+                if not validate_criteria(proposal.selected_fields, proposal.field_mappings):
+                    resolved_batch = _auto_confirm_and_run(
+                        session_id=session_id,
+                        batch=pending_batch,
+                        mappings=proposal.field_mappings,
+                        selected_fields=proposal.selected_fields,
+                        batch_store=batch_store,
+                        session_store=session_store,
+                        tavily_client=tavily_client,
+                        groq_client=groq_client,
+                        background_tasks=background_tasks,
+                    )
+                    return {
+                        "intent": "data_request",
+                        "batch_id": resolved_batch.id,
+                        "status": "running",
+                        "columns": pending_columns,
+                        "sample_rows": pending_sample_rows,
+                        "output_format": resolved_batch.output_format,
+                        "field_mappings": _mapping_to_payload(proposal.field_mappings),
+                        "selected_fields": sorted(proposal.selected_fields),
+                        "search_mode": resolved_batch.search_mode,
+                    }
+
+                question = _clarifying_question_for_columns(pending_columns)
+                session_store.add_turn(
+                    session_id,
+                    role="system",
+                    kind="clarification_question",
+                    payload={"question": question, "batch_id": pending_batch.id},
+                )
+                return {"intent": "clarification_needed", "batch_id": pending_batch.id, "question": question}
+
             input_kind = "single_lookup"
             try:
                 extraction = extract_single_lookup(instructions_text, client=groq_client, context=context)
@@ -426,18 +620,47 @@ def create_app(
                     "turn_index": reply_turn.turn_index,
                 }
 
-            extracted_fields = extraction.fields
-            columns = list(extracted_fields.keys())
-            raw_rows = [extracted_fields] if extracted_fields else [{}]
-            turn_kind = "instruction_text"
-            turn_payload = {"text": instructions_text}
+            fields = dict(extraction.fields)
+            if not _is_standalone_lookup(fields):
+                # A fragment like "domain expert" only makes sense appended
+                # to whatever was just being searched for -- merge onto the
+                # most recent single-lookup turn's fields (its own values
+                # win) rather than searching on the fragment alone.
+                carried = _carry_forward_fields(all_turns)
+                if carried:
+                    fields = {**carried, **fields}
+
+            # Recorded regardless of whether this resolves -- both so a
+            # reopened session shows what was extracted, and so the *next*
+            # turn (however partial) has something to carry forward from.
+            session_store.add_turn(
+                session_id,
+                role="user",
+                kind="instruction_text",
+                payload={"text": instructions_text, "extracted_fields": fields},
+            )
+
+            if not _fields_are_usable(fields):
+                question = _clarifying_question_for_fields(fields)
+                session_store.add_turn(
+                    session_id,
+                    role="system",
+                    kind="clarification_question",
+                    payload={"question": question, "known_fields": fields},
+                )
+                return {"intent": "clarification_needed", "batch_id": None, "question": question}
+
+            columns = list(fields.keys())
+            raw_rows = [fields]
             requested_output_format = extraction.output_format
+
         else:
             raise HTTPException(
                 status_code=422, detail="must provide a file, pasted_text, or instructions_text"
             )
 
-        session_store.add_turn(session_id, role="user", kind=turn_kind, payload=turn_payload)
+        if turn_kind is not None and turn_payload is not None:
+            session_store.add_turn(session_id, role="user", kind=turn_kind, payload=turn_payload)
 
         sample_rows = raw_rows[:5]
         if input_kind == "single_lookup":
@@ -462,26 +685,51 @@ def create_app(
             "field_mappings": _mapping_to_payload(proposal.field_mappings),
             "selected_fields": sorted(proposal.selected_fields),
             # Unit #23: carried on the turn itself so reopening a session can
-            # redraw the mapping editor (its dropdowns and its sample-row
-            # preview) straight from history, instead of rendering the
-            # proposal as inert text with no columns to choose from.
+            # rebuild this card straight from history.
             "columns": columns,
             "sample_rows": sample_rows,
             "output_format": output_format,
         }
         session_store.add_turn(session_id, role="system", kind="mapping_proposal", payload=proposal_payload)
 
-        batch = replace(batch, status="mapping_proposed")
-        batch_store.save_batch(batch)
+        if not validate_criteria(proposal.selected_fields, proposal.field_mappings):
+            # Confident enough to run without ever showing a mapping/criteria
+            # editor -- the conversational replacement for the old two-step
+            # manual confirmation (see `_auto_confirm_and_run`).
+            batch = _auto_confirm_and_run(
+                session_id=session_id,
+                batch=batch,
+                mappings=proposal.field_mappings,
+                selected_fields=proposal.selected_fields,
+                batch_store=batch_store,
+                session_store=session_store,
+                tavily_client=tavily_client,
+                groq_client=groq_client,
+                background_tasks=background_tasks,
+            )
+            return {
+                "intent": "data_request",
+                "batch_id": batch.id,
+                "status": "running",
+                "columns": columns,
+                "sample_rows": sample_rows,
+                "output_format": output_format,
+                "field_mappings": _mapping_to_payload(proposal.field_mappings),
+                "selected_fields": sorted(proposal.selected_fields),
+                "search_mode": batch.search_mode,
+            }
 
-        return {
-            "intent": "data_request",
-            "batch_id": batch.id,
-            "columns": columns,
-            "sample_rows": sample_rows,
-            "output_format": output_format,
-            "proposal": proposal_payload,
-        }
+        # Not confident enough to auto-run. Ask in-thread instead of showing
+        # a manual mapping editor; the next plain-text turn is treated as
+        # the answer (see the `_pending_mapping_batch` branch above).
+        question = _clarifying_question_for_columns(columns)
+        session_store.add_turn(
+            session_id,
+            role="system",
+            kind="clarification_question",
+            payload={"question": question, "batch_id": batch.id},
+        )
+        return {"intent": "clarification_needed", "batch_id": batch.id, "question": question}
 
     @app.put("/sessions/{session_id}/batches/{batch_id}/mapping")
     def confirm_mapping(session_id: str, batch_id: str, mappings_in: list[FieldMappingIn]):

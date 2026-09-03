@@ -189,41 +189,118 @@
   margin: 0 auto;
 }
 
-.input-mode-tabs {
+/* Single pill-shaped bar: a "+" to attach a file, one free-text box, one
+   round send button. Replaces the old three-way mode-toggle row — there is
+   no mode to pick, the backend infers lookup-vs-table from the text. */
+.input-bar-row {
   display: flex;
-  gap: 4px;
+  align-items: flex-end;
+  gap: 6px;
+  width: 100%;
+  background: var(--bubble-system);
+  border: 1px solid var(--border);
+  border-radius: 26px;
+  padding: 6px 6px 6px 10px;
 }
 
-.input-mode-tabs button {
-  flex: 1;
-  padding: 6px 10px;
+.attach-file-input {
+  display: none;
+}
+
+.attach-button {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
   border: 1px solid var(--border);
-  background: #f0f0f4;
-  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1;
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.attach-button:hover:not(:disabled) {
+  background: #e9e9f0;
+}
+
+.attach-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.input-bar-textarea {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  resize: none;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.4;
+  padding: 6px 4px;
+  max-height: 160px;
+}
+
+.attached-file-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+  background: var(--bubble-system);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 4px 6px 4px 12px;
   font-size: 13px;
 }
 
-.input-mode-tabs button.active {
-  background: var(--accent);
-  color: #fff;
-  border-color: var(--accent);
+.attached-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
 }
 
-.input-bar input[type="file"],
-.input-bar textarea {
-  width: 100%;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 8px 10px;
-  font-family: inherit;
-  font-size: 14px;
-  resize: vertical;
+.attached-file-remove {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text-muted);
+  padding: 2px 6px;
+}
+
+.attached-file-remove:hover {
+  color: var(--text);
 }
 
 .send-button {
-  align-self: flex-end;
-  min-width: 100px;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.send-button:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.send-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 button.primary {
@@ -290,73 +367,6 @@ button {
   padding: 4px 8px;
   text-align: left;
   white-space: nowrap;
-}
-
-.mapping-fields {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 8px;
-}
-
-.mapping-field-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 10px;
-}
-
-.mapping-field-label {
-  font-size: 13px;
-  color: var(--text-muted);
-}
-
-.mapping-editor select,
-.mapping-editor input[type="text"] {
-  font-family: inherit;
-  font-size: 13px;
-  padding: 4px 6px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-}
-
-.template-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  font-size: 13px;
-}
-
-.save-template-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.save-template-row input[type="text"] {
-  flex: 1;
-  min-width: 200px;
-}
-
-.criteria-options {
-  display: flex;
-  gap: 16px;
-  flex-wrap: wrap;
-  margin-bottom: 10px;
-}
-
-.criteria-options label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.criteria-options label.disabled {
-  color: var(--text-muted);
 }
 
 .progress-block,

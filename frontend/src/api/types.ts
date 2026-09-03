@@ -50,21 +50,25 @@ export interface MappingProposalPayload {
   field_mappings: FieldMapping[];
   selected_fields: string[];
   // Added in Plan unit #23 — these ride along on the stored turn payload so a
-  // reopened session can redraw the mapping editor (dropdown options + sample
-  // preview) instead of showing the proposal as inert text.
+  // reopened session can rebuild the batch card straight from history.
   columns: string[];
   sample_rows: Record<string, string>[];
   output_format: OutputFormat;
 }
 
-/** POST .../turns when Groq classified the message as a real data request. */
+/** POST .../turns when the mapping was confident enough to confirm and run
+ * without ever showing a mapping/criteria editor — the auto-mapping flow
+ * that replaced the old two-step manual confirmation. */
 export interface DataRequestTurnResponse {
   intent: "data_request";
   batch_id: string;
+  status: "running";
   columns: string[];
   sample_rows: Record<string, string>[];
   output_format: OutputFormat;
-  proposal: MappingProposalPayload;
+  field_mappings: FieldMapping[];
+  selected_fields: string[];
+  search_mode: "person" | "company" | null;
 }
 
 /** POST .../turns when Groq classified the message as a greeting/chitchat —
@@ -76,10 +80,27 @@ export interface GreetingTurnResponse {
   turn_index: number;
 }
 
-export type CreateTurnResponse = DataRequestTurnResponse | GreetingTurnResponse;
+/** POST .../turns when auto-mapping wasn't confident enough to run on its
+ * own — no batch (for a single lookup) or a batch left pending (for a
+ * file/paste whose columns couldn't be confidently mapped). The next
+ * plain-text turn in this session is treated as the answer. */
+export interface ClarificationNeededTurnResponse {
+  intent: "clarification_needed";
+  batch_id: string | null;
+  question: string;
+}
+
+export type CreateTurnResponse =
+  | DataRequestTurnResponse
+  | GreetingTurnResponse
+  | ClarificationNeededTurnResponse;
 
 export function isGreetingTurn(turn: CreateTurnResponse): turn is GreetingTurnResponse {
   return turn.intent === "greeting";
+}
+
+export function isClarificationTurn(turn: CreateTurnResponse): turn is ClarificationNeededTurnResponse {
+  return turn.intent === "clarification_needed";
 }
 
 export interface ConfirmMappingResponse {
@@ -136,7 +157,8 @@ export type TurnKind =
   | "pasted_table"
   | "greeting_reply"
   | "mapping_proposal"
-  | "mapping_confirmed";
+  | "mapping_confirmed"
+  | "clarification_question";
 
 export interface SessionTurn {
   turn_index: number;

@@ -1,22 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import type { BatchStatusResponse, FieldMapping, OutputFormat, RowPayload } from "../api/types";
-import {
-  apiErrorMessage,
-  confirmCriteria,
-  confirmMapping,
-  downloadBatch,
-  getBatchStatus,
-  listBatchRows,
-} from "../api/client";
+import type { BatchStatusResponse, OutputFormat, RowPayload } from "../api/types";
+import { apiErrorMessage, downloadBatch, getBatchStatus, listBatchRows } from "../api/client";
 import type { BatchCardData, BatchResume } from "../lib/chatThread";
-import MappingEditor from "./MappingEditor";
-import CriteriaEditor from "./CriteriaEditor";
 import ResultsTable from "./ResultsTable";
 
 type Stage =
   | "loading"
-  | "mapping"
-  | "criteria"
   | "running"
   | "completed"
   | "failed"
@@ -36,13 +25,10 @@ interface Props {
 const POLL_INTERVAL_MS = 2000;
 
 export default function BatchCard({ sessionId, batch, resume }: Props) {
-  const [stage, setStage] = useState<Stage>(resume ? "loading" : "mapping");
-  const [confirmedMappings, setConfirmedMappings] = useState<FieldMapping[] | null>(
-    resume?.confirmedMappings ?? null
-  );
-  const [confirmedFields, setConfirmedFields] = useState<string[] | null>(
-    resume?.confirmedFields ?? null
-  );
+  // A card is only ever created for a batch that was already confirmed and
+  // handed to run_batch (see app/api.py's auto-mapping flow) — there is no
+  // mapping/criteria step to show here, live or replayed.
+  const [stage, setStage] = useState<Stage>("loading");
   const [batchStatus, setBatchStatus] = useState<BatchStatusResponse | null>(null);
   const [rows, setRows] = useState<RowPayload[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -61,11 +47,7 @@ export default function BatchCard({ sessionId, batch, resume }: Props) {
     return () => stopPolling();
   }, []);
 
-  // Reopened session: turns say what the user did, the batch record says what
-  // happened afterwards. A batch still running when the user closed the tab
-  // simply gets picked back up by the same polling loop.
   useEffect(() => {
-    if (!resume) return;
     let cancelled = false;
 
     (async () => {
@@ -80,13 +62,13 @@ export default function BatchCard({ sessionId, batch, resume }: Props) {
           setStage("completed");
         } else if (status.status === "failed") {
           setStage("failed");
-        } else if (status.status === "running" || status.status === "mapping_confirmed") {
+        } else if (status.status === "mapping_proposed") {
+          // Stuck awaiting a clarifying answer from an earlier session —
+          // nothing to poll toward, and no editor to resume it with.
+          setStage("unavailable");
+        } else {
           setStage("running");
           startPolling();
-        } else if (resume.confirmedMappings) {
-          setStage("criteria");
-        } else {
-          setStage("mapping");
         }
       } catch (err) {
         if (cancelled) return;
@@ -102,20 +84,6 @@ export default function BatchCard({ sessionId, batch, resume }: Props) {
     // different batch means a different component instance.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  async function handleMappingConfirm(mappings: FieldMapping[]) {
-    const res = await confirmMapping(sessionId, batch.batchId, mappings);
-    setConfirmedMappings(res.field_mappings);
-    setStage("criteria");
-  }
-
-  async function handleCriteriaConfirm(selectedFields: string[]) {
-    const res = await confirmCriteria(sessionId, batch.batchId, selectedFields);
-    setConfirmedFields(selectedFields);
-    setBatchStatus(res as BatchStatusResponse);
-    setStage("running");
-    startPolling();
-  }
 
   function startPolling() {
     stopPolling();
@@ -153,10 +121,12 @@ export default function BatchCard({ sessionId, batch, resume }: Props) {
   // the fallback before the first status response lands.
   const outputFormat: OutputFormat = batchStatus?.output_format ?? batch.outputFormat;
   const inlineTable = outputFormat === "table";
+  const searchedOn =
+    resume?.selectedFields ?? batch.selectedFields;
 
   return (
     <div className="batch-card">
-      {stage === "loading" && <p className="hint">Reloading this request…</p>}
+      {stage === "loading" && <p className="hint">Loading this request…</p>}
 
       {stage === "unavailable" && (
         <div className="confirmed-summary">
@@ -165,50 +135,9 @@ export default function BatchCard({ sessionId, batch, resume }: Props) {
         </div>
       )}
 
-      {stage === "mapping" && (
-        <>
-          <p className="stage-title">Proposed field mapping — review and confirm:</p>
-          {batch.columns.length === 0 && (
-            <p className="warning">
-              This proposal was stored before column details were kept, so there are no columns to
-              map. Re-send the request to map it.
-            </p>
-          )}
-          <MappingEditor
-            sessionId={sessionId}
-            batchId={batch.batchId}
-            columns={batch.columns}
-            sampleRows={batch.sampleRows}
-            initialMappings={batch.fieldMappings}
-            onConfirm={handleMappingConfirm}
-          />
-        </>
-      )}
-
-      {stage !== "mapping" && stage !== "loading" && confirmedMappings && (
+      {stage !== "loading" && stage !== "unavailable" && searchedOn.length > 0 && (
         <div className="confirmed-summary">
-          <span className="stage-title">Mapping confirmed:</span>{" "}
-          {confirmedMappings
-            .filter((m) => m.source_column)
-            .map((m) => `${m.standard_field} → ${m.source_column}`)
-            .join(", ") || "(nothing mapped)"}
-        </div>
-      )}
-
-      {stage === "criteria" && confirmedMappings && (
-        <>
-          <p className="stage-title">Select search criteria:</p>
-          <CriteriaEditor
-            mappings={confirmedMappings}
-            initialSelected={confirmedFields ?? batch.selectedFields}
-            onConfirm={handleCriteriaConfirm}
-          />
-        </>
-      )}
-
-      {(stage === "running" || stage === "completed" || stage === "failed") && confirmedFields && (
-        <div className="confirmed-summary">
-          <span className="stage-title">Criteria confirmed:</span> {confirmedFields.join(", ")}
+          <span className="stage-title">Searching by:</span> {searchedOn.join(", ")}
           {batchStatus?.search_mode && <> · mode: {batchStatus.search_mode}</>}
         </div>
       )}

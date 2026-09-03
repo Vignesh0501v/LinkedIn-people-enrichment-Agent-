@@ -1,107 +1,123 @@
-import { useRef, useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { CreateTurnInput } from "../api/client";
-
-type Mode = "file" | "paste" | "instructions";
 
 interface Props {
   disabled?: boolean;
   onSubmit: (input: CreateTurnInput) => Promise<void> | void;
 }
 
+// One free-text box for everything: a single lookup, a pasted table, or
+// text accompanying an attached file. There is no mode to pick — the
+// backend decides what the text is from its own shape (see
+// app/api.py's `_looks_like_pasted_table`). A "+" attaches an optional
+// spreadsheet, mirroring a familiar chat-input pattern instead of a row of
+// toggle buttons for three input "modes" that were never mutually exclusive
+// to begin with.
 export default function InputBar({ disabled, onSubmit }: Props) {
-  const [mode, setMode] = useState<Mode>("file");
   const [file, setFile] = useState<File | null>(null);
-  const [pastedText, setPastedText] = useState("");
-  const [instructionsText, setInstructionsText] = useState("");
+  const [text, setText] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const canSubmit =
-    !submitting &&
-    !disabled &&
-    ((mode === "file" && file != null) ||
-      (mode === "paste" && pastedText.trim().length > 0) ||
-      (mode === "instructions" && instructionsText.trim().length > 0));
+  const canSubmit = !submitting && !disabled && (file != null || text.trim().length > 0);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     if (!canSubmit) return;
     setSubmitting(true);
     try {
-      const input: CreateTurnInput = {
-        file: mode === "file" ? file : null,
-        pastedText: mode === "paste" ? pastedText : null,
-        instructionsText: instructionsText.trim() ? instructionsText.trim() : null,
-      };
+      const input: CreateTurnInput = { file, text: text.trim() ? text.trim() : null };
       await onSubmit(input);
       setFile(null);
-      setPastedText("");
-      setInstructionsText("");
+      setText("");
       if (fileInputRef.current) fileInputRef.current.value = "";
+      if (textareaRef.current) textareaRef.current.style.height = "auto";
     } finally {
       setSubmitting(false);
     }
   }
 
+  function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    // `e.key` is the right check for a real keyboard, but some input paths
+    // (IME composition, certain automation/virtual-keyboard input) report
+    // it as "Unidentified" while still setting `keyCode`/`which` to 13 --
+    // checking both keeps Enter-to-send working in those cases too.
+    const isEnter = e.key === "Enter" || e.keyCode === 13 || e.which === 13;
+    if (isEnter && !e.shiftKey) {
+      e.preventDefault();
+      void handleSubmit(e);
+    }
+  }
+
+  function handleTextChange(value: string) {
+    setText(value);
+    const el = textareaRef.current;
+    if (el) {
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    }
+  }
+
   return (
     <form className="input-bar" onSubmit={handleSubmit}>
-      <div className="input-mode-tabs">
-        <button
-          type="button"
-          className={mode === "file" ? "active" : ""}
-          onClick={() => setMode("file")}
-        >
-          Upload file
-        </button>
-        <button
-          type="button"
-          className={mode === "paste" ? "active" : ""}
-          onClick={() => setMode("paste")}
-        >
-          Paste table
-        </button>
-        <button
-          type="button"
-          className={mode === "instructions" ? "active" : ""}
-          onClick={() => setMode("instructions")}
-        >
-          Single lookup
-        </button>
-      </div>
+      {file && (
+        <div className="attached-file-chip">
+          <span className="attached-file-name">📎 {file.name}</span>
+          <button
+            type="button"
+            className="attached-file-remove"
+            aria-label="Remove attached file"
+            onClick={() => {
+              setFile(null);
+              if (fileInputRef.current) fileInputRef.current.value = "";
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
 
-      {mode === "file" && (
+      <div className="input-bar-row">
         <input
           ref={fileInputRef}
           type="file"
           accept=".xlsx"
+          className="attach-file-input"
           onChange={(e) => setFile(e.target.files?.[0] ?? null)}
         />
-      )}
+        <button
+          type="button"
+          className="attach-button"
+          aria-label="Attach a spreadsheet"
+          title="Attach a spreadsheet"
+          disabled={disabled}
+          onClick={() => fileInputRef.current?.click()}
+        >
+          +
+        </button>
 
-      {mode === "paste" && (
         <textarea
-          placeholder="Paste tab- or comma-delimited rows, including a header row…"
-          value={pastedText}
-          onChange={(e) => setPastedText(e.target.value)}
-          rows={4}
+          ref={textareaRef}
+          className="input-bar-textarea"
+          placeholder='Ask anything — e.g. "Find Jane Doe at Acme Corp", or paste a table…'
+          value={text}
+          onChange={(e) => handleTextChange(e.target.value)}
+          onKeyDown={handleKeyDown}
+          rows={1}
+          disabled={disabled}
         />
-      )}
 
-      <textarea
-        className="instructions-textarea"
-        placeholder={
-          mode === "instructions"
-            ? "e.g. Find Jane Doe at Acme Corp"
-            : "Optional instructions to accompany this upload…"
-        }
-        value={instructionsText}
-        onChange={(e) => setInstructionsText(e.target.value)}
-        rows={2}
-      />
-
-      <button type="submit" className="primary send-button" disabled={!canSubmit}>
-        {submitting ? "Sending…" : "Send"}
-      </button>
+        <button
+          type="submit"
+          className="send-button"
+          aria-label="Send"
+          title="Send"
+          disabled={!canSubmit}
+        >
+          {submitting ? "…" : "↑"}
+        </button>
+      </div>
     </form>
   );
 }
