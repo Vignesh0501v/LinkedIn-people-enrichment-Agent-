@@ -1,14 +1,4 @@
-import type {
-  ApplyTemplateResponse,
-  BatchStatusResponse,
-  ConfirmMappingResponse,
-  CreateTurnResponse,
-  FieldMapping,
-  MappingTemplate,
-  RowPayload,
-  SessionPayload,
-  SessionSummary,
-} from "./types";
+import type { BatchStatusResponse, CreateTurnResponse, RowPayload, SessionPayload, SessionSummary } from "./types";
 
 const API_BASE_URL: string =
   (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://localhost:8000";
@@ -71,8 +61,10 @@ export async function getSession(sessionId: string): Promise<SessionPayload> {
 
 export interface CreateTurnInput {
   file?: File | null;
-  pastedText?: string | null;
-  instructionsText?: string | null;
+  /** Whatever's typed in the single input box — a lookup request or a
+   * pasted table. The backend decides which from the text's own shape, so
+   * the client never has to pick a mode. */
+  text?: string | null;
 }
 
 export async function createTurn(
@@ -81,74 +73,12 @@ export async function createTurn(
 ): Promise<CreateTurnResponse> {
   const form = new FormData();
   if (input.file) form.append("file", input.file);
-  if (input.pastedText) form.append("pasted_text", input.pastedText);
-  if (input.instructionsText) form.append("instructions_text", input.instructionsText);
+  if (input.text) form.append("instructions_text", input.text);
 
   const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/turns`, {
     method: "POST",
     body: form,
   });
-  return handleResponse(res);
-}
-
-export async function confirmMapping(
-  sessionId: string,
-  batchId: string,
-  mappings: FieldMapping[]
-): Promise<ConfirmMappingResponse> {
-  const res = await fetch(
-    `${API_BASE_URL}/sessions/${sessionId}/batches/${batchId}/mapping`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(mappings),
-    }
-  );
-  return handleResponse(res);
-}
-
-export async function applyMappingTemplate(
-  sessionId: string,
-  batchId: string,
-  templateId: string
-): Promise<ApplyTemplateResponse> {
-  const res = await fetch(
-    `${API_BASE_URL}/sessions/${sessionId}/batches/${batchId}/mapping/apply-template/${templateId}`,
-    { method: "POST" }
-  );
-  return handleResponse(res);
-}
-
-export async function listMappingTemplates(): Promise<{ templates: MappingTemplate[] }> {
-  const res = await fetch(`${API_BASE_URL}/mapping-templates`);
-  return handleResponse(res);
-}
-
-export async function createMappingTemplate(
-  sourceLabel: string,
-  fieldMappings: Record<string, string>
-): Promise<MappingTemplate> {
-  const res = await fetch(`${API_BASE_URL}/mapping-templates`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ source_label: sourceLabel, field_mappings: fieldMappings }),
-  });
-  return handleResponse(res);
-}
-
-export async function confirmCriteria(
-  sessionId: string,
-  batchId: string,
-  selectedFields: string[]
-): Promise<BatchStatusResponse> {
-  const res = await fetch(
-    `${API_BASE_URL}/sessions/${sessionId}/batches/${batchId}/criteria`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ selected_fields: selectedFields }),
-    }
-  );
   return handleResponse(res);
 }
 

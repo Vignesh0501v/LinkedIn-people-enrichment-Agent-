@@ -1,14 +1,14 @@
 // The chat thread's message model, plus the replay that rebuilds it from a
 // stored session's turn history (GET /sessions/{id}).
 //
-// Replay is deliberately a *reconstruction*, not a transcript dump: a stored
-// `mapping_proposal` turn carries everything the live proposal response
-// carried (Plan unit #23 added `columns`/`sample_rows`/`output_format` to the
-// payload), so a reopened session can put a working MappingEditor back on
-// screen and let the user finish a mapping they abandoned last visit. The
-// follow-up `mapping_confirmed` turns are folded *into* that batch's card
-// rather than rendered as separate bubbles, because they were never separate
-// bubbles in the live thread either.
+// Replay is a *reconstruction*, not a transcript dump: a `mapping_proposal`
+// turn only becomes a batch card if a paired `mapping_confirmed` turn
+// exists for the same batch (auto-mapping confirmed and ran it) — one that
+// never got confirmed is a batch still stuck waiting on a clarifying
+// answer from an earlier session, which has nothing useful to resume, so it
+// renders as nothing rather than a dead editor. The `mapping_confirmed`
+// turns themselves are folded *into* that batch's card rather than shown as
+// separate bubbles, same as they were live.
 
 import type { FieldMapping, OutputFormat, SessionPayload, SessionTurn } from "../api/types";
 
@@ -22,13 +22,10 @@ export interface BatchCardData {
   outputFormat: OutputFormat;
 }
 
-/** What history tells us already happened to a replayed batch. BatchCard
- * still confirms against `GET .../batches/{id}` before deciding a stage —
- * turns record what the *user* did, the batch record knows whether the run
- * since finished, failed, or is still going. */
+/** What history tells us already happened to a replayed batch — just enough
+ * to show what it searched on before the live status fetch lands. */
 export interface BatchResume {
-  confirmedMappings: FieldMapping[] | null;
-  confirmedFields: string[] | null;
+  selectedFields: string[];
 }
 
 export type ChatMessage =
@@ -111,22 +108,15 @@ function userTurnText(turn: SessionTurn): string {
  * ever-incrementing ones.
  */
 export function replaySession(session: SessionPayload): ChatMessage[] {
-  // First pass: what the user later confirmed, keyed by batch. Both
-  // confirm-mapping and confirm-criteria write `kind: "mapping_confirmed"`
-  // turns; they're told apart by which payload key they carry.
+  // What auto-mapping actually confirmed, keyed by batch — a
+  // `mapping_proposal` turn only becomes a batch card if it has a match here.
   const resumeByBatch = new Map<string, BatchResume>();
   for (const turn of session.turns) {
     if (turn.kind !== "mapping_confirmed") continue;
     const payload = turn.payload ?? {};
     const batchId = asString(payload, "batch_id");
     if (!batchId) continue;
-    const current = resumeByBatch.get(batchId) ?? { confirmedMappings: null, confirmedFields: null };
-    const mappings = asFieldMappings(payload, "field_mappings");
-    if (mappings && mappings.length > 0) current.confirmedMappings = mappings;
-    if (Array.isArray(payload.selected_fields)) {
-      current.confirmedFields = asStringList(payload, "selected_fields");
-    }
-    resumeByBatch.set(batchId, current);
+    resumeByBatch.set(batchId, { selectedFields: asStringList(payload, "selected_fields") });
   }
 
   const messages: ChatMessage[] = [];
@@ -138,7 +128,8 @@ export function replaySession(session: SessionPayload): ChatMessage[] {
 
     if (turn.kind === "mapping_proposal") {
       const batchId = asString(payload, "batch_id");
-      if (!batchId) continue;
+      const resume = batchId ? resumeByBatch.get(batchId) : undefined;
+      if (!batchId || !resume) continue; // never confirmed -- nothing to resume
       messages.push({
         id,
         role: "system",
@@ -151,13 +142,18 @@ export function replaySession(session: SessionPayload): ChatMessage[] {
           selectedFields: asStringList(payload, "selected_fields"),
           outputFormat: asOutputFormat(payload),
         },
-        resume: resumeByBatch.get(batchId) ?? { confirmedMappings: null, confirmedFields: null },
+        resume,
       });
       continue;
     }
 
     if (turn.kind === "greeting_reply") {
       messages.push({ id, role: "system", kind: "reply", text: asString(payload, "text") });
+      continue;
+    }
+
+    if (turn.kind === "clarification_question") {
+      messages.push({ id, role: "system", kind: "reply", text: asString(payload, "question") });
       continue;
     }
 

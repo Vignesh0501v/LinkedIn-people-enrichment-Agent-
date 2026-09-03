@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 import type { SessionSummary } from "./api/types";
-import { isGreetingTurn } from "./api/types";
+import { isClarificationTurn, isGreetingTurn } from "./api/types";
 import {
   apiErrorMessage,
   createSession,
@@ -19,11 +19,7 @@ import { newMessageId, replaySession, type ChatMessage } from "./lib/chatThread"
 function describeInput(input: CreateTurnInput): string {
   const parts: string[] = [];
   if (input.file) parts.push(`Uploaded file: ${input.file.name}`);
-  if (input.pastedText) {
-    const preview = input.pastedText.split("\n").slice(0, 3).join(" / ");
-    parts.push(`Pasted table: ${preview}${input.pastedText.split("\n").length > 3 ? "…" : ""}`);
-  }
-  if (input.instructionsText) parts.push(input.instructionsText);
+  if (input.text) parts.push(input.text);
   return parts.join("\n") || "(empty)";
 }
 
@@ -76,6 +72,14 @@ export default function App() {
           ...prev,
           { id: newMessageId(), role: "system", kind: "reply", text: turn.reply },
         ]);
+      } else if (isClarificationTurn(turn)) {
+        // Auto-mapping wasn't confident enough to run on its own — ask in
+        // thread instead of showing a mapping/criteria editor. The next
+        // plain-text turn the user sends is treated as the answer.
+        setMessages((prev) => [
+          ...prev,
+          { id: newMessageId(), role: "system", kind: "reply", text: turn.question },
+        ]);
       } else {
         setMessages((prev) => [
           ...prev,
@@ -87,8 +91,8 @@ export default function App() {
               batchId: turn.batch_id,
               columns: turn.columns,
               sampleRows: turn.sample_rows,
-              fieldMappings: turn.proposal.field_mappings,
-              selectedFields: turn.proposal.selected_fields,
+              fieldMappings: turn.field_mappings,
+              selectedFields: turn.selected_fields,
               outputFormat: turn.output_format,
             },
           },
@@ -174,8 +178,8 @@ export default function App() {
           {replaying && <p className="empty-hint">Reopening session…</p>}
           {!replaying && messages.length === 0 && (
             <p className="empty-hint">
-              Upload a spreadsheet, paste a table, or type a single lookup (e.g. "Find Jane Doe at
-              Acme Corp") to get started.
+              Type a lookup (e.g. "Find Jane Doe at Acme Corp"), paste a table, or attach a
+              spreadsheet with the + button to get started.
             </p>
           )}
           {messages.map((m) => {
